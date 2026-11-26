@@ -190,13 +190,14 @@ fn kernel_main(boot_info_ptr: u64) -> ! {
     let worker_mask = AtomicU64::new(0);
     let t0 = cpu::now_nanos();
     for _ in 0..200 {
-        smp::parallel_run(smp::online_cores(), &|wid, _total| {
+        smp::parallel_run(smp::physical_cores(), &|wid, _total| {
             worker_mask.fetch_or(1u64 << wid, Ordering::Relaxed);
         });
     }
     let barrier_ns = cpu::now_nanos().saturating_sub(t0) / 200;
     kprintln!(
-        "[smp] 200 barriers across {} cores: {} ns/barrier (mask={:#x})",
+        "[smp] 200 barriers across {} physical cores ({} logical): {} ns/barrier (mask={:#x})",
+        smp::physical_cores(),
         smp::online_cores(),
         barrier_ns,
         worker_mask.load(Ordering::Relaxed)
@@ -271,11 +272,18 @@ fn kernel_main(boot_info_ptr: u64) -> ! {
     let shared = UiShared::new(sys);
     let shared_for_ui = Rc::clone(&shared);
 
+    let ui_scale: f32 = if boot_info.fb.width >= 3000 {
+        2.0
+    } else if boot_info.fb.width >= 1920 {
+        1.25
+    } else {
+        1.0
+    };
     let mut hw_fb = fb::Framebuffer::new(boot_info.fb);
     let mut ui = CranposeFramebuffer::new(
         boot_info.fb.width,
         boot_info.fb.height,
-        1.0,
+        ui_scale,
         SystemTheme::Dark,
         &[],
         move || CranosApp(UiHandle(Rc::clone(&shared_for_ui))),
@@ -318,7 +326,7 @@ fn kernel_main(boot_info_ptr: u64) -> ! {
                     cursor_x = (cursor_x + dx as f32).clamp(0.0, (boot_info.fb.width - 1) as f32);
                     cursor_y = (cursor_y + dy as f32).clamp(0.0, (boot_info.fb.height - 1) as f32);
                     cursor_moved = true;
-                    ui.mouse_move(cursor_x, cursor_y);
+                    ui.mouse_move(cursor_x / ui_scale, cursor_y / ui_scale);
                     hw_fb.draw_cursor(cursor_x as u32, cursor_y as u32);
                 }
                 InputEvent::MouseButton { button, pressed } => {
@@ -328,7 +336,7 @@ fn kernel_main(boot_info_ptr: u64) -> ! {
                         1 => PointerButton::Secondary,
                         _ => continue,
                     };
-                    ui.mouse_move(cursor_x, cursor_y);
+                    ui.mouse_move(cursor_x / ui_scale, cursor_y / ui_scale);
                     if pressed {
                         ui.mouse_button_pressed(btn);
                     } else {
@@ -338,7 +346,13 @@ fn kernel_main(boot_info_ptr: u64) -> ! {
                 InputEvent::MouseWheel { delta } => {
                     ui.mouse_scroll(0.0, (delta as f32) * 32.0);
                 }
-                InputEvent::KeyDown { key, ctrl, .. } => match key {
+                InputEvent::KeyDown { key, ctrl, alt, .. } => match key {
+                    KeyCode::Delete if ctrl && alt => {
+                        shared.borrow_mut().actions.push(UiAction::Reboot);
+                    }
+                    KeyCode::F10 => {
+                        shared.borrow_mut().actions.push(UiAction::Reboot);
+                    }
                     KeyCode::Char(c) if ctrl && (c == 'c' || c == 'C') => {
                         shared.borrow_mut().actions.push(UiAction::StopGeneration);
                     }
@@ -427,6 +441,10 @@ fn kernel_main(boot_info_ptr: u64) -> ! {
                     s.messages.clear();
                     s.phase = SessionPhase::Idle;
                     s.notify();
+                }
+                UiAction::Reboot => {
+                    kprintln!("[cranos] Rebooting via hardware reset...");
+                    cpu::reboot();
                 }
             }
         }

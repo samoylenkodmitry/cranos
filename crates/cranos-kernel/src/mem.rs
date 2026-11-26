@@ -54,7 +54,7 @@ struct Region {
 }
 
 struct HeapInner {
-    regions: [Region; 64],
+    regions: [Region; 128],
     region_count: usize,
     total_bytes: usize,
     allocated_bytes: usize,
@@ -65,7 +65,7 @@ struct HeapInner {
 impl HeapInner {
     const fn new() -> Self {
         Self {
-            regions: [const { Region { cur: 0, end: 0 } }; 64],
+            regions: [const { Region { cur: 0, end: 0 } }; 128],
             region_count: 0,
             total_bytes: 0,
             allocated_bytes: 0,
@@ -89,12 +89,17 @@ impl HeapInner {
     }
 
     fn bump_raw(&mut self, size: usize, align: usize) -> *mut u8 {
+        self.bump_raw_limit(size, align, usize::MAX)
+    }
+
+    fn bump_raw_limit(&mut self, size: usize, align: usize, max_addr: usize) -> *mut u8 {
         let align = align.max(16);
         for i in 0..self.region_count {
             let r = &mut self.regions[i];
             let aligned = (r.cur + align - 1) & !(align - 1);
             if let Some(next) = aligned.checked_add(size)
                 && next <= r.end
+                && next <= max_addr
             {
                 r.cur = next;
                 self.allocated_bytes += size;
@@ -298,11 +303,16 @@ pub fn alloc_zeroed_page_phys() -> Option<u64> {
 }
 
 /// Allocates contiguous 4 KiB-aligned zeroed physical memory (e.g. for xHCI rings / AP stacks).
+/// Prefers memory below 4 GiB for maximum DMA controller compatibility, falling back to high RAM.
 pub fn alloc_dma_zeroed(size: usize, align: usize) -> Option<u64> {
     let align = align.max(PAGE_SIZE);
     let size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
     ALLOCATOR.lock.lock();
-    let ptr = unsafe { (*ALLOCATOR.inner.get()).bump_raw(size, align) };
+    let inner = unsafe { &mut *ALLOCATOR.inner.get() };
+    let mut ptr = inner.bump_raw_limit(size, align, 0x1_0000_0000usize);
+    if ptr.is_null() {
+        ptr = inner.bump_raw(size, align);
+    }
     ALLOCATOR.lock.unlock();
     if ptr.is_null() {
         return None;

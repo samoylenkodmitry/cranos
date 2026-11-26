@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# Safely installs CranOS as an independent UEFI boot entry on samarch-1.
+# Safely installs CranOS as an independent UEFI boot entry on an Arch UKI host
+# (such as samarch).
 #
-# Safety guarantees for samarch-1's Arch UKI setup:
-#   - NEVER touches /usr/local/sbin/direct-uki-sync or pacman hooks.
+# Safety guarantees for Arch UKI setups:
 #   - NEVER touches /boot/efi/EFI/Linux/* or /boot/vmlinuz-*.
-#   - NEVER changes the default BootOrder first entry (Arch UKI cachyos-bore).
+#   - NEVER removes any existing UEFI boot entry.
+#   - NEVER changes the #1 default BootOrder entry (e.g. Arch UKI cachyos-bore).
 #   - Places CranOS in its own isolated /boot/efi/EFI/cranos/cranos.efi path.
-#   - Places the LLM GGUF in /media/data/cranos/model.gguf (nvme0n1p2 ext4)
-#     so /boot/efi (512 MiB ESP) uses < 7 MiB.
+#   - Places the LLM GGUF in /cranos/model.gguf on the root ext4 partition (or
+#     /media/data/cranos/model.gguf when /media/data is a separate ext4 mount),
+#     so the 512 MiB ESP only stores the ~7 MiB cranos.efi binary.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 EFI_SRC="${1:-$ROOT/dist/cranos.efi}"
-MODEL_SRC="${2:-/media/data/cranos/Qwen3-4B-Q4_K_M.gguf}"
+MODEL_SRC="${2:-}"
 ESP_MOUNT="/boot/efi"
 EFI_DIR="$ESP_MOUNT/EFI/cranos"
 EFI_DST="$EFI_DIR/cranos.efi"
@@ -42,19 +44,22 @@ echo "==> Installing CranOS EFI binary into isolated $EFI_DST (leaving EFI/Linux
 mkdir -p "$EFI_DIR"
 install -m 0644 "$EFI_SRC" "$EFI_DST"
 
-if [[ -f "$MODEL_SRC" ]]; then
-    mkdir -p /media/data/cranos
-    if [[ "$(realpath "$MODEL_SRC")" != "/media/data/cranos/model.gguf" ]]; then
-        ln -sf "$(realpath "$MODEL_SRC")" /media/data/cranos/model.gguf
-        # Note: our bare-metal ext4 reader opens regular files directly; copy or hardlink if symlink.
-        rm -f /media/data/cranos/model.gguf
-        ln "$(realpath "$MODEL_SRC")" /media/data/cranos/model.gguf 2>/dev/null \
-            || cp -a "$MODEL_SRC" /media/data/cranos/model.gguf
+if [[ -n "$MODEL_SRC" && -f "$MODEL_SRC" ]]; then
+    if mountpoint -q /media/data 2>/dev/null; then
+        MODEL_DIR="/media/data/cranos"
+    else
+        MODEL_DIR="/cranos"
     fi
-    echo "==> Model ready at /media/data/cranos/model.gguf ($(du -h /media/data/cranos/model.gguf | awk '{print $1}'))"
+    MODEL_DST="$MODEL_DIR/model.gguf"
+    mkdir -p "$MODEL_DIR"
+    if [[ "$(realpath "$MODEL_SRC")" != "$(realpath -m "$MODEL_DST")" ]]; then
+        ln -f "$(realpath "$MODEL_SRC")" "$MODEL_DST" 2>/dev/null \
+            || install -m 0644 "$MODEL_SRC" "$MODEL_DST"
+    fi
+    echo "==> Model ready at $MODEL_DST ($(du -h "$MODEL_DST" | awk '{print $1}'))"
 fi
 
-# Save current BootOrder so we guarantee Arch UKI remains the #1 default boot entry.
+# Save current BootOrder so the existing #1 default entry stays first.
 ORIG_ORDER="$(efibootmgr | awk '/^BootOrder:/ { print $2 }')"
 
 if efibootmgr -v | grep -Fqi "$EFI_REL"; then
@@ -62,19 +67,20 @@ if efibootmgr -v | grep -Fqi "$EFI_REL"; then
 else
     echo "==> Creating independent UEFI boot entry '$LABEL' on $disk partition $part..."
     efibootmgr -c -d "$disk" -p "$part" -L "$LABEL" -l "$EFI_REL" >/dev/null
-    # Restore original default first entry while keeping CranOS appended at the end.
-    CRANOS_NUM="$(efibootmgr -v | awk -F'[*\t]' 'tolower($0) ~ /\\efi\\cranos\\cranos\.efi/ { match($1, /Boot([0-9A-F]+)/, m); print m[1] }' | head -1)"
+    CRANOS_NUM="$(efibootmgr -v | awk -F'[*\t]' 'index(tolower($0), "\\efi\\cranos\\cranos.efi") > 0 { match($1, /Boot([0-9A-F]+)/, m); print m[1] }' | head -1)"
     if [[ -n "$ORIG_ORDER" && -n "$CRANOS_NUM" ]]; then
-        CLEAN_ORIG="$(echo "$ORIG_ORDER" | tr ',' '\n' | grep -v "^${CRANOS_NUM}$" | tr '\n' ',' | sed 's/,$//')"
-        efibootmgr -o "${CLEAN_ORIG},${CRANOS_NUM}" >/dev/null
+        CLEAN_ORIG="$(echo "$ORIG_ORDER" | tr ',' '\n' | grep -v "^${CRANOS_NUM}$" | tr '\n' ',' | sed 's/,$//' || true)"
+        if [[ -n "$CLEAN_ORIG" ]]; then
+            efibootmgr -o "${CLEAN_ORIG},${CRANOS_NUM}" >/dev/null
+        fi
     fi
 fi
 
 echo ""
-echo "==> Current UEFI Boot Entries (Arch UKI remains default #1):"
+echo "==> Current UEFI Boot Entries (default #1 preserved):"
 efibootmgr
 echo ""
+CRANOS_NUM="$(efibootmgr -v | awk -F'[*\t]' 'index(tolower($0), "\\efi\\cranos\\cranos.efi") > 0 { match($1, /Boot([0-9A-F]+)/, m); print m[1] }' | head -1)"
 echo "To boot CranOS once on next reboot without changing default boot order:"
-CRANOS_NUM="$(efibootmgr -v | awk -F'[*\t]' 'tolower($0) ~ /\\efi\\cranos\\cranos\.efi/ { match($1, /Boot([0-9A-F]+)/, m); print m[1] }' | head -1)"
 echo "  sudo efibootmgr --bootnext ${CRANOS_NUM:-XXXX} && sudo reboot"
-echo "Or press F8 at ASUS D700MD POST to pick '$LABEL' from the UEFI Boot Menu."
+echo "Or press F7 / F12 at BIOS POST to pick '$LABEL' from the UEFI Boot Menu."

@@ -20,6 +20,7 @@ pub enum KeyCode {
     F2,
     F3,
     F4,
+    F10,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,6 +149,7 @@ pub fn hid_usage_to_keycode(usage: u8, shift: bool) -> Option<KeyCode> {
         0x3B => Some(KeyCode::F2),
         0x3C => Some(KeyCode::F3),
         0x3D => Some(KeyCode::F4),
+        0x43 => Some(KeyCode::F10),
         0x4A => Some(KeyCode::Home),
         0x4B => Some(KeyCode::PageUp),
         0x4C => Some(KeyCode::Delete),

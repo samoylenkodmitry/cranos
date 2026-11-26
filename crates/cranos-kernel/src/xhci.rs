@@ -56,8 +56,9 @@ struct PciXhci {
     bar0: u64,
 }
 
-fn find_xhci_pci() -> Option<PciXhci> {
-    for bus in 0..=16u8 {
+fn find_all_xhci_pci() -> Vec<PciXhci> {
+    let mut found = Vec::new();
+    for bus in 0..=255u8 {
         for dev in 0..32u8 {
             for func in 0..8u8 {
                 let id = pci_read32(bus, dev, func, 0x00);
@@ -85,7 +86,7 @@ fn find_xhci_pci() -> Option<PciXhci> {
                     };
                     let bar0 = ((bar0_hi as u64) << 32) | ((bar0_lo & !0xF) as u64);
                     if bar0 != 0 {
-                        return Some(PciXhci {
+                        found.push(PciXhci {
                             bus,
                             dev,
                             func,
@@ -104,7 +105,7 @@ fn find_xhci_pci() -> Option<PciXhci> {
             }
         }
     }
-    None
+    found
 }
 
 #[repr(C, align(16))]
@@ -259,6 +260,9 @@ impl XhciController {
         let mut off = (xecp_dwords as u64) * 4;
         for _ in 0..32 {
             let reg = self.rd32(self.cap_base + off);
+            if reg == 0xFFFF_FFFF || reg == 0 {
+                break;
+            }
             let cap_id = (reg & 0xFF) as u8;
             if cap_id == 1 {
                 // USBLEGSUP: claim OS ownership (bit 24) and wait for BIOS (bit 16) to clear.
@@ -772,13 +776,9 @@ impl XhciController {
     }
 }
 
-static mut XHCI: Option<XhciController> = None;
+static mut XHCI_CONTROLLERS: Vec<XhciController> = Vec::new();
 
-pub fn init(pml4_phys: u64) {
-    let Some(pci) = find_xhci_pci() else {
-        kprintln!("[xhci] No xHCI controller found on PCI");
-        return;
-    };
+fn init_one(pci: PciXhci, pml4_phys: u64) -> Option<XhciController> {
     kprintln!(
         "[xhci] PCI {:02x}:{:02x}.{} [{:04x}:{:04x}] BAR0={:#x}",
         pci.bus,
@@ -789,19 +789,44 @@ pub fn init(pml4_phys: u64) {
         pci.bar0
     );
 
-    // Map BAR0 as Uncacheable (PAT UC) before touching MMIO registers.
-    cpu::set_identity_range_cache_attr(pml4_phys, pci.bar0, 0x1_0000, cpu::PAT_UC_BITS);
+    // Map 1 MiB of BAR0 as Uncacheable (PAT UC) before touching MMIO registers
+    // (AMD Matisse xHCI uses a 1 MiB BAR0 region).
+    cpu::set_identity_range_cache_attr(pml4_phys, pci.bar0, 0x10_0000, cpu::PAT_UC_BITS);
 
     let cap_base = pci.bar0;
     let cap_len = unsafe { (cap_base as *const u8).read_volatile() } as u64;
     let hcsparams1 = unsafe { ((cap_base + 0x04) as *const u32).read_volatile() };
+    if cap_len < 0x20 || cap_len == 0xFF || hcsparams1 == 0xFFFF_FFFF || hcsparams1 == 0 {
+        kprintln!(
+            "[xhci] Skipping PCI {:02x}:{:02x}.{} (unresponsive/D3: cap_len={:#x})",
+            pci.bus,
+            pci.dev,
+            pci.func,
+            cap_len
+        );
+        return None;
+    }
     let hcsparams2 = unsafe { ((cap_base + 0x08) as *const u32).read_volatile() };
     let hccparams1 = unsafe { ((cap_base + 0x10) as *const u32).read_volatile() };
     let dboff = unsafe { ((cap_base + 0x14) as *const u32).read_volatile() } & !0x3;
     let rtsoff = unsafe { ((cap_base + 0x18) as *const u32).read_volatile() } & !0x1F;
+    if dboff == 0 || rtsoff == 0 || dboff >= 0x10_0000 || rtsoff >= 0x10_0000 {
+        kprintln!(
+            "[xhci] Skipping PCI {:02x}:{:02x}.{} (invalid offsets db={:#x} rt={:#x})",
+            pci.bus,
+            pci.dev,
+            pci.func,
+            dboff,
+            rtsoff
+        );
+        return None;
+    }
 
     let max_slots = (hcsparams1 & 0xFF).min(64) as u8;
     let max_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
+    if max_slots == 0 || max_ports == 0 {
+        return None;
+    }
     let max_scratch_hi = (hcsparams2 >> 21) & 0x1F;
     let max_scratch_lo = (hcsparams2 >> 27) & 0x1F;
     let max_scratchpads = ((max_scratch_hi << 5) | max_scratch_lo) as usize;
@@ -812,18 +837,10 @@ pub fn init(pml4_phys: u64) {
     let db_base = cap_base + dboff as u64;
     let rt_base = cap_base + rtsoff as u64;
 
-    let Some(dcbaa) = mem::alloc_dma_zeroed(4096, 4096) else {
-        return;
-    };
-    let Some(cmd_ring) = TrbRing::new() else {
-        return;
-    };
-    let Some(evt_ring_phys) = mem::alloc_dma_zeroed(EVENT_RING_LEN * 16, 4096) else {
-        return;
-    };
-    let Some(erst_phys) = mem::alloc_dma_zeroed(4096, 4096) else {
-        return;
-    };
+    let dcbaa = mem::alloc_dma_zeroed(4096, 4096)?;
+    let cmd_ring = TrbRing::new()?;
+    let evt_ring_phys = mem::alloc_dma_zeroed(EVENT_RING_LEN * 16, 4096)?;
+    let erst_phys = mem::alloc_dma_zeroed(4096, 4096)?;
 
     let mut ctrl = XhciController {
         cap_base,
@@ -845,28 +862,50 @@ pub fn init(pml4_phys: u64) {
     // Halt controller
     let cmd = ctrl.rd32(op_base);
     ctrl.wr32(op_base, cmd & !1);
+    let mut halted = false;
     for _ in 0..100 {
         if (ctrl.rd32(op_base + 0x04) & 1) != 0 {
+            halted = true;
             break;
         }
         cpu::busy_wait_us(1000);
     }
+    if !halted {
+        kprintln!(
+            "[xhci] Skipping PCI {:02x}:{:02x}.{} (halt timeout)",
+            pci.bus,
+            pci.dev,
+            pci.func
+        );
+        return None;
+    }
 
     // Reset controller (HCRST)
     ctrl.wr32(op_base, 1 << 1);
+    let mut reset_ok = false;
     for _ in 0..500 {
         let c = ctrl.rd32(op_base);
         let s = ctrl.rd32(op_base + 0x04);
         if (c & (1 << 1)) == 0 && (s & (1 << 11)) == 0 {
+            reset_ok = true;
             break;
         }
         cpu::busy_wait_us(1000);
+    }
+    if !reset_ok {
+        kprintln!(
+            "[xhci] Skipping PCI {:02x}:{:02x}.{} (reset timeout)",
+            pci.bus,
+            pci.dev,
+            pci.func
+        );
+        return None;
     }
 
     // MaxSlotsEn
     ctrl.wr32(op_base + 0x38, max_slots as u32);
 
-    // Scratchpad buffers (required on Intel 600-series xHCI!)
+    // Scratchpad buffers (required on Intel 600-series and AMD xHCI)
     if max_scratchpads > 0 {
         if let Some(sp_arr) = mem::alloc_dma_zeroed((max_scratchpads * 8).max(4096), 4096) {
             for i in 0..max_scratchpads {
@@ -902,15 +941,29 @@ pub fn init(pml4_phys: u64) {
 
     // Run controller (RS = 1)
     ctrl.wr32(op_base, 1);
+    let mut running = false;
     for _ in 0..200 {
         if (ctrl.rd32(op_base + 0x04) & 1) == 0 {
+            running = true;
             break;
         }
         cpu::busy_wait_us(1000);
     }
+    if !running {
+        kprintln!(
+            "[xhci] Skipping PCI {:02x}:{:02x}.{} (run timeout)",
+            pci.bus,
+            pci.dev,
+            pci.func
+        );
+        return None;
+    }
 
     kprintln!(
-        "[xhci] Running (ports={}, slots={}, ctx={}B, scratch={})",
+        "[xhci] Running {:02x}:{:02x}.{} (ports={}, slots={}, ctx={}B, scratch={})",
+        pci.bus,
+        pci.dev,
+        pci.func,
         max_ports,
         max_slots,
         ctx_size,
@@ -922,16 +975,42 @@ pub fn init(pml4_phys: u64) {
     for port in 1..=max_ports {
         ctrl.probe_port(port);
     }
-    kprintln!("[xhci] Bound {} HID device(s)", ctrl.hid_devices.len());
+    kprintln!(
+        "[xhci] {:02x}:{:02x}.{} bound {} HID device(s)",
+        pci.bus,
+        pci.dev,
+        pci.func,
+        ctrl.hid_devices.len()
+    );
+    Some(ctrl)
+}
 
+pub fn init(pml4_phys: u64) {
+    let controllers = find_all_xhci_pci();
+    if controllers.is_empty() {
+        kprintln!("[xhci] No xHCI controller found on PCI");
+        return;
+    }
+    let mut ready = Vec::new();
+    for pci in controllers {
+        if let Some(ctrl) = init_one(pci, pml4_phys) {
+            ready.push(ctrl);
+        }
+    }
+    let total_hid: usize = ready.iter().map(|c| c.hid_devices.len()).sum();
+    kprintln!(
+        "[xhci] {} active controller(s), {} total HID device(s)",
+        ready.len(),
+        total_hid
+    );
     unsafe {
-        XHCI = Some(ctrl);
+        XHCI_CONTROLLERS = ready;
     }
 }
 
 pub fn poll() {
     unsafe {
-        if let Some(ctrl) = (*(&raw mut XHCI)).as_mut() {
+        for ctrl in &mut *(&raw mut XHCI_CONTROLLERS) {
             ctrl.poll();
         }
     }

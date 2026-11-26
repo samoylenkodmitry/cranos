@@ -38,6 +38,7 @@ pub enum UiAction {
     ToggleThinking,
     RunBenchmark,
     ClearChat,
+    Reboot,
 }
 
 pub struct UiShared {
@@ -469,9 +470,9 @@ pub fn CranosApp(handle: UiHandle) {
                 move || {
                     let display_input = if draft_bar.is_empty() {
                         if caret {
-                            String::from("| Type a prompt and press Enter... (F1 Think | F2 Bench | F3 Clear)")
+                            String::from("| Type a prompt and press Enter... (F1 Think | F2 Bench | F3 Clear | F10 Reboot)")
                         } else {
-                            String::from("  Type a prompt and press Enter... (F1 Think | F2 Bench | F3 Clear)")
+                            String::from("  Type a prompt and press Enter... (F1 Think | F2 Bench | F3 Clear | F10 Reboot)")
                         }
                     } else if caret {
                         format!("{}|", draft_bar)
@@ -501,6 +502,7 @@ pub fn CranosApp(handle: UiHandle) {
                     let s_think = Rc::clone(&shared_bar);
                     let s_bench = Rc::clone(&shared_bar);
                     let s_clear = Rc::clone(&shared_bar);
+                    let s_reboot = Rc::clone(&shared_bar);
 
                     if phase != SessionPhase::Idle {
                         ActionBtn(
@@ -560,6 +562,15 @@ pub fn CranosApp(handle: UiHandle) {
                         text_muted,
                         move || {
                             s_clear.borrow_mut().actions.push(UiAction::ClearChat);
+                        },
+                    );
+
+                    ActionBtn(
+                        String::from("Reboot"),
+                        Color::from_rgb_u8(54, 24, 34),
+                        accent_rose,
+                        move || {
+                            s_reboot.borrow_mut().actions.push(UiAction::Reboot);
                         },
                     );
                 },

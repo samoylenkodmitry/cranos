@@ -3,7 +3,7 @@ use core::arch::x86_64::__cpuid;
 use cranos_boot_info::{KERNEL_STACK_PAGES, KERNEL_STACK_TOP};
 
 use crate::elf::LoadedKernel;
-use crate::uefi::{ALLOCATE_ANY_PAGES, BootServices, EFI_LOADER_DATA, EFI_SUCCESS};
+use crate::uefi::{ALLOCATE_ANY_PAGES, ALLOCATE_MAX_ADDRESS, BootServices, EFI_LOADER_DATA, EFI_SUCCESS};
 
 const PRESENT: u64 = 1 << 0;
 const WRITABLE: u64 = 1 << 1;
@@ -11,10 +11,13 @@ const HUGE: u64 = 1 << 7;
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 fn alloc_zero_page(bs: &BootServices) -> Result<u64, &'static str> {
-    let mut addr = 0u64;
-    let st = (bs.allocate_pages)(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, 1, &mut addr);
+    // Keep PML4 and boot page tables strictly below 4 GiB so the 32-bit
+    // protected-mode AP startup trampoline can load CR3 without truncation on
+    // high-RAM machines (e.g. 64 GiB samarch).
+    let mut addr = 0xFFFF_F000u64;
+    let st = (bs.allocate_pages)(ALLOCATE_MAX_ADDRESS, EFI_LOADER_DATA, 1, &mut addr);
     if st != EFI_SUCCESS {
-        return Err("failed to allocate page table page");
+        return Err("failed to allocate page table page below 4 GiB");
     }
     unsafe {
         core::ptr::write_bytes(addr as *mut u8, 0, 4096);

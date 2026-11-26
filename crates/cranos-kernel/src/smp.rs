@@ -155,17 +155,29 @@ static PHYSICAL_CORES: AtomicUsize = AtomicUsize::new(1);
 static WORKER_IS_PRIMARY: [AtomicU32; MAX_WORKERS] = [const { AtomicU32::new(0) }; MAX_WORKERS];
 
 fn is_smt_secondary_thread() -> bool {
-    // CPUID leaf 0xB subleaf 0 gives SMT level width in EAX[4:0], x2APIC ID in EDX.
+    // 1. CPUID leaf 0xB subleaf 0: SMT level width in EAX[4:0], x2APIC ID in EDX
+    //    (supported on Intel Core and AMD Zen 2 / Ryzen 3950X).
     let max_leaf = core::arch::x86_64::__cpuid(0).eax;
-    if max_leaf < 0xB {
-        return false;
+    if max_leaf >= 0xB {
+        let smt = __cpuid_count(0xB, 0);
+        let level_type = (smt.ecx >> 8) & 0xFF;
+        let shift = smt.eax & 0x1F;
+        if level_type == 1 && shift > 0 {
+            let smt_mask = (1u32 << shift) - 1;
+            return (smt.edx & smt_mask) != 0;
+        }
     }
-    let smt = __cpuid_count(0xB, 0);
-    let level_type = (smt.ecx >> 8) & 0xFF;
-    let shift = smt.eax & 0x1F;
-    if level_type == 1 && shift > 0 {
-        let smt_mask = (1u32 << shift) - 1;
-        return (smt.edx & smt_mask) != 0;
+    // 2. Fallback: AMD Topology Extensions leaf 0x8000_001E (EBX[15:8] = threads_per_core - 1).
+    let max_ext = core::arch::x86_64::__cpuid(0x8000_0000).eax;
+    if max_ext >= 0x8000_001E {
+        let ext1 = core::arch::x86_64::__cpuid(0x8000_0001);
+        if (ext1.ecx & (1 << 22)) != 0 {
+            let topo = core::arch::x86_64::__cpuid(0x8000_001E);
+            let threads_per_core = ((topo.ebx >> 8) & 0xFF) + 1;
+            if threads_per_core > 1 {
+                return (topo.eax % threads_per_core) != 0;
+            }
+        }
     }
     false
 }
@@ -181,30 +193,50 @@ extern "C" fn ap_entry(worker_id: u32) -> ! {
     if idx < MAX_WORKERS {
         WORKER_IS_PRIMARY[idx].store(u32::from(!secondary), Ordering::Relaxed);
     }
-    if !secondary {
-        PHYSICAL_CORES.fetch_add(1, Ordering::Relaxed);
-    }
     ONLINE_CORES.fetch_add(1, Ordering::Release);
 
     let mailbox = unsafe { &*(MAILBOX_PHYS as *const ApMailbox) };
+
+    // Park SMT secondary threads in HLT immediately: memory-bandwidth-bound LLM
+    // matmul runs faster on dedicated physical cores, and halting sibling
+    // threads avoids unnecessary heat and L1/L2 contention (e.g. Ryzen 9 3950X).
+    if secondary {
+        mailbox.ready.store(1, Ordering::Release);
+        loop {
+            unsafe { asm!("cli; hlt", options(nomem, nostack)) };
+        }
+    }
+
+    // Claim a dense physical-core slot (1..PHYSICAL_CORES) before signalling ready.
+    let primary_slot = PHYSICAL_CORES.fetch_add(1, Ordering::AcqRel);
     mailbox.ready.store(1, Ordering::Release);
 
-    // Tight zero-jitter spin-barrier loop for bare-metal parallel inference.
+    // Tight zero-jitter spin-barrier loop during active inference, with gentle
+    // PAUSE backoff when idle between prompts to keep laptop thermals cool.
     let mut last_epoch = DISPATCH.epoch.load(Ordering::Acquire);
+    let mut idle_spins: u32 = 0;
     loop {
         let cur = DISPATCH.epoch.load(Ordering::Acquire);
         if cur == last_epoch {
-            core::hint::spin_loop();
+            if idle_spins < 200_000 {
+                idle_spins += 1;
+                core::hint::spin_loop();
+            } else {
+                for _ in 0..64 {
+                    core::hint::spin_loop();
+                }
+            }
             continue;
         }
+        idle_spins = 0;
         last_epoch = cur;
         let total = DISPATCH.active_workers.load(Ordering::Relaxed);
-        if idx < total {
+        if primary_slot < total {
             let f_raw = DISPATCH.fn_ptr.load(Ordering::Relaxed);
             if f_raw != 0 {
                 let f: WorkFn = unsafe { core::mem::transmute(f_raw) };
                 let ctx = DISPATCH.ctx_ptr.load(Ordering::Relaxed) as *const ();
-                f(idx, total, ctx);
+                f(primary_slot, total, ctx);
             }
             DONE.count.fetch_add(1, Ordering::Release);
         }
@@ -376,7 +408,7 @@ pub fn physical_cores() -> usize {
 /// simultaneously using our lock-free atomic spin barrier.
 /// Worker 0 runs on the calling core (BSP); workers 1..num_workers run on APs.
 pub fn parallel_run<F: Fn(usize, usize) + Sync>(max_workers: usize, f: &F) {
-    let workers = max_workers.min(online_cores()).max(1);
+    let workers = max_workers.min(physical_cores()).max(1);
     if workers == 1 {
         f(0, 1);
         return;

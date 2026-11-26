@@ -84,19 +84,22 @@ fn init_gop(bs: &BootServices, st: &SystemTable) -> Result<FramebufferInfo, &'st
         }
         let w = info.horizontal_resolution;
         let h = info.vertical_resolution;
-        if w < 800 || h < 600 || w > 2560 || h > 1600 {
+        if w < 800 || h < 600 || w > 3840 || h > 2160 {
             continue;
         }
-        let score: i64 = if (w, h) == (1280, 800) || (w, h) == (1280, 720) {
+        let score: i64 = if (w, h) == (1920, 1080) {
+            10_500_000
+        } else if (w, h) == (1280, 800) || (w, h) == (1280, 720) {
             10_000_000
-        } else if (w, h) == (1920, 1080) {
-            9_500_000
         } else if (w, h) == (1280, 1024) {
             9_000_000
         } else if (w, h) == (1024, 768) {
             8_000_000
-        } else {
+        } else if w <= 2560 && h <= 1600 {
             (w as i64) * (h as i64)
+        } else {
+            // 4K works as a fallback when no 1080p/1280p mode is exposed.
+            1_000_000
         };
         if score > best_score {
             best_score = score;
@@ -306,7 +309,7 @@ fn try_load_ext4_model(bs: &BootServices, st: &SystemTable) -> Option<LoadedMode
         }
         let bio = bio_ptr as *mut BlockIoProtocol;
         for &(parts, label) in EXT4_PATHS {
-            if let Some(file) = ext4::try_load_ext4_file(bs, bio, parts) {
+            if let Some(file) = ext4::try_load_ext4_file(bs, st, bio, parts, label) {
                 print_ascii(st, "[cranos-boot] Loaded ");
                 print_ascii(st, label);
                 print_ascii(st, " (");

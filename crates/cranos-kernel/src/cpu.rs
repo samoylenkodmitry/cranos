@@ -253,16 +253,25 @@ fn calibrate_tsc_pit() -> u64 {
     const TICKS: u16 = 11_932; // ~10.000 ms
     unsafe {
         let gate = inb(0x61);
-        outb(0x61, (gate & !0x02) | 0x01); // Enable ch2 gate, disable speaker
+        // Disable speaker + lower channel 2 gate before programming counter.
+        outb(0x61, gate & !0x03);
         outb(0x43, 0xB0); // Channel 2, lobyte/hibyte, mode 0 (interrupt on terminal count)
         outb(0x42, (TICKS & 0xFF) as u8);
         outb(0x42, (TICKS >> 8) as u8);
+        // Raise channel 2 gate to start countdown.
+        outb(0x61, (gate & !0x02) | 0x01);
 
         let start = _rdtsc();
+        let mut spins = 0u32;
         while (inb(0x61) & 0x20) == 0 {
+            spins = spins.wrapping_add(1);
+            if spins > 20_000_000 {
+                return 0;
+            }
             core::hint::spin_loop();
         }
         let end = _rdtsc();
+        outb(0x61, gate & !0x03);
         let delta = end.saturating_sub(start);
         ((delta as u128) * (PIT_HZ as u128) / (TICKS as u128)) as u64
     }
@@ -287,19 +296,45 @@ pub fn calibrate_tsc() -> u64 {
             hz = base_mhz * 1_000_000;
         }
     }
-    // Fallback: calibrate directly against PIT channel 2.
-    if hz < 100_000_000 {
+    // Fallback: calibrate directly against PIT channel 2 (standard on AMD Zen 2).
+    if hz < 400_000_000 || hz > 10_000_000_000 {
         let pit_hz = calibrate_tsc_pit();
-        if pit_hz >= 100_000_000 {
+        if pit_hz >= 400_000_000 && pit_hz <= 10_000_000_000 {
             hz = pit_hz;
         } else {
-            hz = 2_500_000_000;
+            hz = 3_500_000_000;
         }
     }
 
     TSC_HZ.store(hz, Ordering::Relaxed);
     BOOT_TSC.store(unsafe { _rdtsc() }, Ordering::Relaxed);
     hz
+}
+
+/// Triggers a clean hardware reboot (AMD FCH / Intel PCI 0xCF9, i8042, triple fault).
+pub fn reboot() -> ! {
+    unsafe {
+        asm!("cli", options(nomem, nostack));
+        // PCI Reset Control Register (0xCF9): full cold/warm platform reset.
+        outb(0xCF9, 0x02);
+        outb(0xCF9, 0x06);
+        // Fallback: i8042 keyboard controller reset pulse.
+        for _ in 0..10_000 {
+            if (inb(0x64) & 0x02) == 0 {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        outb(0x64, 0xFE);
+        // Final fallback: zero IDT + int3 triple fault.
+        let null_idtr: [u8; 10] = [0; 10];
+        asm!(
+            "lidt [{}]",
+            "int3",
+            in(reg) null_idtr.as_ptr(),
+            options(noreturn)
+        );
+    }
 }
 
 #[inline]

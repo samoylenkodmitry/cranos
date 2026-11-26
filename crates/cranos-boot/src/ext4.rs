@@ -1,6 +1,9 @@
 use core::ffi::c_void;
 
-use crate::uefi::{ALLOCATE_ANY_PAGES, BlockIoProtocol, BootServices, EFI_LOADER_DATA, EFI_SUCCESS};
+use crate::uefi::{
+    ALLOCATE_ANY_PAGES, BlockIoProtocol, BootServices, EFI_LOADER_DATA, EFI_SUCCESS, SystemTable,
+    print_ascii, print_u64,
+};
 
 const EXT4_SUPER_MAGIC: u16 = 0xEF53;
 const EXT4_FEATURE_INCOMPAT_64BIT: u32 = 0x0080;
@@ -12,6 +15,7 @@ struct BlockReader {
     bio: *mut BlockIoProtocol,
     media_id: u32,
     sector_size: usize,
+    io_align: usize,
     scratch: *mut u8,
     scratch_cap: usize,
 }
@@ -29,9 +33,13 @@ impl BlockReader {
         while remaining > 0 {
             let lba = cur_off / ss;
             let in_sector = (cur_off % ss) as usize;
+            let dst_ptr = unsafe { dst.as_mut_ptr().add(dst_pos) };
+            let aligned_ok = self.io_align <= 1 || ((dst_ptr as usize) % self.io_align) == 0;
 
             // Fast path: aligned direct DMA into caller buffer for large reads.
-            if in_sector == 0 && remaining >= self.sector_size {
+            // UEFI NVMe BlockIo returns EFI_INVALID_PARAMETER if Buffer is not
+            // aligned to Media->IoAlign, so unaligned stack buffers route via scratch.
+            if in_sector == 0 && remaining >= self.sector_size && aligned_ok {
                 let max_chunk = (remaining / self.sector_size).min(2048) * self.sector_size;
                 let st = unsafe {
                     ((*self.bio).read_blocks)(
@@ -39,7 +47,7 @@ impl BlockReader {
                         self.media_id,
                         lba,
                         max_chunk,
-                        dst.as_mut_ptr().add(dst_pos) as *mut c_void,
+                        dst_ptr as *mut c_void,
                     )
                 };
                 if st != EFI_SUCCESS {
@@ -304,15 +312,18 @@ pub struct LoadedExt4File {
 /// Returns a 2 MiB-aligned physical buffer on success.
 pub fn try_load_ext4_file(
     bs: &BootServices,
+    st: &SystemTable,
     bio: *mut BlockIoProtocol,
     path_parts: &[&str],
+    label: &str,
 ) -> Option<LoadedExt4File> {
     let media = unsafe { &*(*bio).media };
     if !media.media_present || !media.logical_partition || media.block_size == 0 {
         return None;
     }
+    let io_align = (media.io_align as usize).max(1);
     let mut scratch_addr = 0u64;
-    let scratch_pages = 16usize; // 64 KiB scratch buffer
+    let scratch_pages = 16usize; // 64 KiB page-aligned scratch buffer
     if (bs.allocate_pages)(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, scratch_pages, &mut scratch_addr)
         != EFI_SUCCESS
     {
@@ -322,6 +333,7 @@ pub fn try_load_ext4_file(
         bio,
         media_id: media.media_id,
         sector_size: media.block_size as usize,
+        io_align,
         scratch: scratch_addr as *mut u8,
         scratch_cap: scratch_pages * 4096,
     };
@@ -336,6 +348,12 @@ pub fn try_load_ext4_file(
         if file_inode.size == 0 {
             return None;
         }
+        print_ascii(st, "[cranos-boot] Reading ");
+        print_ascii(st, label);
+        print_ascii(st, " (");
+        print_u64(st, file_inode.size / (1024 * 1024));
+        print_ascii(st, " MiB)...\n");
+
         // Allocate with 2 MiB alignment padding so weights start on a 2 MiB boundary.
         let extra = 2 * 1024 * 1024u64;
         let total_pages = ((file_inode.size + extra + 4095) / 4096) as usize;

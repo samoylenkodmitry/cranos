@@ -169,7 +169,10 @@ pub fn hid_usage_to_keycode(usage: u8, shift: bool) -> Option<KeyCode> {
 
 /// Polls COM1 serial input so headless QEMU testing or serial terminals can type into CranOS.
 pub fn poll_serial() {
-    while let Some(b) = crate::serial::try_read_byte() {
+    for _ in 0..32 {
+        let Some(b) = crate::serial::try_read_byte() else {
+            break;
+        };
         let key = match b {
             b'\r' | b'\n' => Some(KeyCode::Enter),
             0x08 | 0x7F => Some(KeyCode::Backspace),

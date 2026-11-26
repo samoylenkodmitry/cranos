@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 const COM1: u16 = 0x3F8;
 
 static SERIAL_LOCK: AtomicBool = AtomicBool::new(false);
+static SERIAL_PRESENT: AtomicBool = AtomicBool::new(false);
 
 #[inline]
 pub unsafe fn outb(port: u16, val: u8) {
@@ -20,6 +21,17 @@ pub unsafe fn inb(port: u16) -> u8 {
 
 pub fn init() {
     unsafe {
+        // Probe 16550 UART via Scratch Register (COM1 + 7) so laptops without a
+        // physical COM1 port (floating 0xFF bus) never hang in poll_serial().
+        outb(COM1 + 7, 0x5A);
+        let r1 = inb(COM1 + 7);
+        outb(COM1 + 7, 0xA5);
+        let r2 = inb(COM1 + 7);
+        if r1 != 0x5A || r2 != 0xA5 {
+            SERIAL_PRESENT.store(false, Ordering::Relaxed);
+            return;
+        }
+
         outb(COM1 + 1, 0x00); // Disable interrupts
         outb(COM1 + 3, 0x80); // Enable DLAB
         outb(COM1 + 0, 0x01); // 115200 baud divisor low
@@ -27,13 +39,20 @@ pub fn init() {
         outb(COM1 + 3, 0x03); // 8N1
         outb(COM1 + 2, 0xC7); // Enable FIFO
         outb(COM1 + 4, 0x0B); // IRQs enabled, RTS/DSR set
+
+        let lsr = inb(COM1 + 5);
+        SERIAL_PRESENT.store(lsr != 0xFF, Ordering::Relaxed);
     }
 }
 
 fn write_byte_raw(b: u8) {
+    if !SERIAL_PRESENT.load(Ordering::Relaxed) {
+        return;
+    }
     unsafe {
         for _ in 0..100_000 {
-            if (inb(COM1 + 5) & 0x20) != 0 {
+            let lsr = inb(COM1 + 5);
+            if lsr == 0xFF || (lsr & 0x20) != 0 {
                 break;
             }
             core::hint::spin_loop();
@@ -43,8 +62,12 @@ fn write_byte_raw(b: u8) {
 }
 
 pub fn try_read_byte() -> Option<u8> {
+    if !SERIAL_PRESENT.load(Ordering::Relaxed) {
+        return None;
+    }
     unsafe {
-        if (inb(COM1 + 5) & 0x01) != 0 {
+        let lsr = inb(COM1 + 5);
+        if lsr != 0xFF && (lsr & 0x01) != 0 {
             Some(inb(COM1))
         } else {
             None

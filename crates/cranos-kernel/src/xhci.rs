@@ -141,6 +141,7 @@ const TRB_TYPE_ADDRESS_DEVICE: u32 = 11;
 const TRB_TYPE_CONFIGURE_EP: u32 = 12;
 const TRB_TYPE_TRANSFER_EVENT: u32 = 32;
 const TRB_TYPE_CMD_COMPLETION: u32 = 33;
+const TRB_TYPE_PORT_STATUS_CHANGE: u32 = 34;
 
 const RING_LEN: usize = 64;
 const EVENT_RING_LEN: usize = 256;
@@ -200,6 +201,7 @@ enum HidKind {
 }
 
 struct HidDevice {
+    port: u8,
     slot_id: u8,
     dci: u8,
     kind: HidKind,
@@ -717,6 +719,7 @@ impl XhciController {
             );
 
             self.hid_devices.push(HidDevice {
+                port,
                 slot_id,
                 dci: ep.dci,
                 kind: ep.kind,
@@ -730,11 +733,19 @@ impl XhciController {
     }
 
     fn poll(&mut self) {
+        let mut hotplug_ports: Vec<u8> = Vec::new();
         for _ in 0..64 {
             let Some(ev) = self.pop_event() else {
                 break;
             };
             let ty = (ev.control >> 10) & 0x3F;
+            if ty == TRB_TYPE_PORT_STATUS_CHANGE {
+                let port = ((ev.param >> 24) & 0xFF) as u8;
+                if port >= 1 && port <= self.max_ports && !hotplug_ports.contains(&port) {
+                    hotplug_ports.push(port);
+                }
+                continue;
+            }
             if ty != TRB_TYPE_TRANSFER_EVENT {
                 continue;
             }
@@ -837,6 +848,18 @@ impl XhciController {
             }
             if let Some((s, d)) = requeue {
                 self.ring_doorbell(s, d as u32);
+            }
+        }
+        // Handle USB hot-plug / unplug events detected on root hub ports.
+        for port in hotplug_ports {
+            let sc = self.rd32(self.portsc_addr(port));
+            // Clear RW1C change bits first.
+            self.wr32(self.portsc_addr(port), (sc & 0x0E01_C3E0) | (sc & 0x00FE_0000));
+            if (sc & 1) == 0 {
+                self.hid_devices.retain(|d| d.port != port);
+            } else if !self.hid_devices.iter().any(|d| d.port == port) {
+                cpu::busy_wait_us(50_000);
+                self.probe_port(port);
             }
         }
     }

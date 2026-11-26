@@ -302,7 +302,7 @@ fn kernel_main(boot_info_ptr: u64) -> ! {
     let mut rgba_scratch: Vec<u8> = Vec::new();
     let mut cursor_x = (boot_info.fb.width as f32) * 0.5;
     let mut cursor_y = (boot_info.fb.height as f32) * 0.5;
-    let mut cursor_moved = false;
+    let mut cursor_moved = xhci_hids > 0;
 
     render_cranpose_frame(
         &mut ui,

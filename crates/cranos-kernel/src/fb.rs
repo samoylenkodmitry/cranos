@@ -1,4 +1,34 @@
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
 use cranos_boot_info::{FramebufferInfo, PixelFormat};
+
+static DIAG_FB_ADDR: AtomicU64 = AtomicU64::new(0);
+static DIAG_FB_STRIDE: AtomicU32 = AtomicU32::new(0);
+static DIAG_FB_WIDTH: AtomicU32 = AtomicU32::new(0);
+
+pub fn register_diag_fb(info: &FramebufferInfo) {
+    DIAG_FB_ADDR.store(info.phys_addr, Ordering::Relaxed);
+    DIAG_FB_STRIDE.store(info.stride_pixels, Ordering::Relaxed);
+    DIAG_FB_WIDTH.store(info.width, Ordering::Relaxed);
+}
+
+/// Draws a thin colored strip at the top of the GOP framebuffer for early boot
+/// checkpoints or fatal exception visibility when no serial console is attached.
+pub fn diag_strip(fraction_of_8: u32, color_xrgb: u32, height: u32) {
+    let base = DIAG_FB_ADDR.load(Ordering::Relaxed);
+    let stride = DIAG_FB_STRIDE.load(Ordering::Relaxed) as usize;
+    let width = DIAG_FB_WIDTH.load(Ordering::Relaxed) as usize;
+    if base == 0 || stride == 0 || width == 0 {
+        return;
+    }
+    let fill_w = (width * (fraction_of_8.min(8) as usize)) / 8;
+    let ptr = base as *mut u32;
+    for y in 0..height as usize {
+        for x in 0..fill_w {
+            unsafe { ptr.add(y * stride + x).write_volatile(color_xrgb) };
+        }
+    }
+}
 
 const CURSOR_W: usize = 12;
 const CURSOR_H: usize = 16;

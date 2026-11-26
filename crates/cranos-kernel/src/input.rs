@@ -38,6 +38,10 @@ pub enum InputEvent {
         dx: i32,
         dy: i32,
     },
+    MouseAbs {
+        x: u16, // 0..=32767
+        y: u16, // 0..=32767
+    },
     MouseButton {
         button: u8, // 0=left, 1=right, 2=middle
         pressed: bool,

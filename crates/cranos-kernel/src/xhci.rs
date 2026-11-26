@@ -196,6 +196,7 @@ impl TrbRing {
 enum HidKind {
     Keyboard,
     Mouse,
+    AbsMouse,
 }
 
 struct HidDevice {
@@ -358,10 +359,21 @@ impl XhciController {
         ep0_ring.push(0, 0, (TRB_TYPE_STATUS << 10) | (1 << 5) | status_dir);
         self.ring_doorbell(slot_id, 1); // EP0 DCI = 1
 
-        if let Some(ev) = self.wait_event(TRB_TYPE_TRANSFER_EVENT, 500) {
-            let cc = (ev.status >> 24) & 0xFF;
-            // 1 = Success, 13 = Short Packet (acceptable for descriptor reads)
-            return cc == 1 || cc == 13;
+        let deadline = cpu::now_nanos() + 500_000_000;
+        while cpu::now_nanos() < deadline {
+            if let Some(ev) = self.pop_event() {
+                let ty = (ev.control >> 10) & 0x3F;
+                if ty == TRB_TYPE_TRANSFER_EVENT {
+                    let ev_slot = ((ev.control >> 24) & 0xFF) as u8;
+                    let ev_dci = ((ev.control >> 16) & 0x1F) as u8;
+                    if ev_slot == slot_id && ev_dci == 1 {
+                        let cc = (ev.status >> 24) & 0xFF;
+                        // 1 = Success, 13 = Short Packet (acceptable for descriptor reads)
+                        return cc == 1 || cc == 13;
+                    }
+                }
+            }
+            core::hint::spin_loop();
         }
         false
     }
@@ -531,11 +543,18 @@ impl XhciController {
                     let interval = cfg[pos + 6];
                     // Interrupt IN endpoint
                     if (ep_addr & 0x80) != 0 && (attrs & 0x3) == 3 {
+                        // A 5-byte Mouse HID interface (e.g. DMXT KVM gadget) carries
+                        // [buttons, abs_x(u16 LE), abs_y(u16 LE)] in 0..=32767.
+                        let resolved_kind = if kind == HidKind::Mouse && mps == 5 {
+                            HidKind::AbsMouse
+                        } else {
+                            kind
+                        };
                         found.push(FoundHid {
-                            kind,
+                            kind: resolved_kind,
                             iface_num,
                             ep_addr,
-                            mps: mps.max(8),
+                            mps: mps.max(4),
                             interval,
                         });
                         cur_hid = None;
@@ -554,15 +573,30 @@ impl XhciController {
             return;
         }
 
-        // 6. Configure each HID Interrupt IN endpoint and switch interface to Boot Protocol.
+        // 6. Configure ALL HID Interrupt IN endpoints of this (possibly composite)
+        // device in a single xHCI Configure Endpoint command.
+        struct PendingEp {
+            kind: HidKind,
+            dci: u8,
+            mps: u16,
+            report_len: u16,
+            ring: TrbRing,
+            buf_phys: u64,
+            xhci_interval: u32,
+        }
+        let mut pending: Vec<PendingEp> = Vec::new();
+
         for hid in found {
-            // SET_PROTOCOL(Boot = 0) and SET_IDLE(0)
-            let _ = self.control_transfer(
-                slot_id,
-                &mut ep0_ring,
-                make_setup(0x21, 0x0B, 0, hid.iface_num as u16, 0),
-                None,
-            );
+            // Switch Boot Keyboard / Relative Mouse to Boot Protocol (0), but keep
+            // 5-byte Absolute Pointer on its native Report Protocol.
+            if hid.kind != HidKind::AbsMouse {
+                let _ = self.control_transfer(
+                    slot_id,
+                    &mut ep0_ring,
+                    make_setup(0x21, 0x0B, 0, hid.iface_num as u16, 0),
+                    None,
+                );
+            }
             let _ = self.control_transfer(
                 slot_id,
                 &mut ep0_ring,
@@ -575,17 +609,14 @@ impl XhciController {
             if dci < 2 || dci >= 32 {
                 continue;
             }
-            let Some(mut ep_ring) = TrbRing::new() else {
+            let Some(ep_ring) = TrbRing::new() else {
                 continue;
             };
             let Some(report_buf) = mem::alloc_dma_zeroed(4096, 4096) else {
                 continue;
             };
-
-            // Compute xHCI Interval field based on port speed.
             let xhci_interval: u32 = match speed {
                 1 | 2 => {
-                    // FS/LS: bInterval is in ms; xHCI encodes 2^(val-3) ms -> val = ceil(log2(ms)) + 3
                     let ms = (hid.interval as u32).clamp(1, 255);
                     let mut p = 0u32;
                     while (1u32 << p) < ms && p < 8 {
@@ -595,84 +626,103 @@ impl XhciController {
                 }
                 _ => (hid.interval as u32).saturating_sub(1).clamp(0, 15),
             };
+            let report_len = match hid.kind {
+                HidKind::Keyboard => 8u16.min(hid.mps),
+                HidKind::Mouse => 4u16.min(hid.mps),
+                HidKind::AbsMouse => 5u16.min(hid.mps),
+            };
+            pending.push(PendingEp {
+                kind: hid.kind,
+                dci,
+                mps: hid.mps,
+                report_len,
+                ring: ep_ring,
+                buf_phys: report_buf,
+                xhci_interval,
+            });
+        }
 
-            // Zero input context and populate Slot Context + Endpoint Context.
-            unsafe {
-                core::ptr::write_bytes(in_ctx as *mut u8, 0, 33 * self.ctx_size);
-                // Copy current output Slot Context into Input Slot Context (index 1).
-                core::ptr::copy_nonoverlapping(
-                    dev_ctx as *const u8,
-                    (in_ctx + self.ctx_size as u64) as *mut u8,
-                    self.ctx_size,
-                );
-                let icc = self.ctx_ptr(in_ctx, 0);
-                icc.add(1).write_volatile(1 | (1u32 << dci)); // Add Slot + DCI
+        if pending.is_empty() {
+            return;
+        }
 
-                let slot_c = self.ctx_ptr(in_ctx, 1);
-                let cur_d0 = slot_c.add(0).read_volatile();
-                let cur_entries = (cur_d0 >> 27) & 0x1F;
-                let new_entries = cur_entries.max(dci as u32);
-                slot_c
-                    .add(0)
-                    .write_volatile((cur_d0 & !(0x1F << 27)) | (new_entries << 27));
-
-                // Endpoint context at index (dci + 1)
-                let ep_c = self.ctx_ptr(in_ctx, dci as usize + 1);
-                ep_c.add(0).write_volatile(xhci_interval << 16);
+        unsafe {
+            core::ptr::write_bytes(in_ctx as *mut u8, 0, 33 * self.ctx_size);
+            core::ptr::copy_nonoverlapping(
+                dev_ctx as *const u8,
+                (in_ctx + self.ctx_size as u64) as *mut u8,
+                self.ctx_size,
+            );
+            let mut add_flags = 1u32; // Slot Context
+            let mut max_entries = 1u32;
+            for ep in &pending {
+                add_flags |= 1u32 << ep.dci;
+                max_entries = max_entries.max(ep.dci as u32);
+                let ep_c = self.ctx_ptr(in_ctx, ep.dci as usize + 1);
+                ep_c.add(0).write_volatile(ep.xhci_interval << 16);
                 // CErr=3, EPType=7 (Interrupt IN), MaxPacketSize
                 ep_c.add(1)
-                    .write_volatile((3 << 1) | (7 << 3) | ((hid.mps as u32) << 16));
-                let deq = ep_ring.phys | 1;
+                    .write_volatile((3 << 1) | (7 << 3) | ((ep.mps as u32) << 16));
+                let deq = ep.ring.phys | 1;
                 ep_c.add(2).write_volatile(deq as u32);
                 ep_c.add(3).write_volatile((deq >> 32) as u32);
                 // Avg TRB len + Max ESIT Payload Lo
                 ep_c.add(4)
-                    .write_volatile((hid.mps as u32) | ((hid.mps as u32) << 16));
+                    .write_volatile((ep.mps as u32) | ((ep.mps as u32) << 16));
             }
+            let icc = self.ctx_ptr(in_ctx, 0);
+            icc.add(1).write_volatile(add_flags);
 
-            if self
-                .send_command(
-                    in_ctx,
-                    (TRB_TYPE_CONFIGURE_EP << 10) | ((slot_id as u32) << 24),
-                )
-                .is_none()
-            {
-                continue;
-            }
+            let slot_c = self.ctx_ptr(in_ctx, 1);
+            let cur_d0 = slot_c.add(0).read_volatile();
+            let cur_entries = (cur_d0 >> 27) & 0x1F;
+            let new_entries = cur_entries.max(max_entries);
+            slot_c
+                .add(0)
+                .write_volatile((cur_d0 & !(0x1F << 27)) | (new_entries << 27));
+        }
 
-            let report_len = match hid.kind {
-                HidKind::Keyboard => 8u16.min(hid.mps),
-                HidKind::Mouse => 4u16.min(hid.mps),
-            };
+        if self
+            .send_command(
+                in_ctx,
+                (TRB_TYPE_CONFIGURE_EP << 10) | ((slot_id as u32) << 24),
+            )
+            .is_none()
+        {
+            return;
+        }
+
+        for mut ep in pending {
             // Queue initial Interrupt IN Normal TRB (IOC | ISP).
-            ep_ring.push(
-                report_buf,
-                report_len as u32,
+            ep.ring.push(
+                ep.buf_phys,
+                ep.report_len as u32,
                 (TRB_TYPE_NORMAL << 10) | (1 << 5) | (1 << 2),
             );
-            self.ring_doorbell(slot_id, dci as u32);
+            self.ring_doorbell(slot_id, ep.dci as u32);
 
-            let label = match hid.kind {
+            let label = match ep.kind {
                 HidKind::Keyboard => "USB HID Keyboard",
                 HidKind::Mouse => "USB HID Mouse",
+                HidKind::AbsMouse => "USB HID AbsPointer",
             };
             kprintln!(
                 "[xhci] Bound {} on port {} (slot={} dci={} speed={} mps={})",
                 label,
                 port,
                 slot_id,
-                dci,
+                ep.dci,
                 speed,
-                hid.mps
+                ep.mps
             );
 
             self.hid_devices.push(HidDevice {
                 slot_id,
-                dci,
-                kind: hid.kind,
-                report_len,
-                ring: ep_ring,
-                buf_phys: report_buf,
+                dci: ep.dci,
+                kind: ep.kind,
+                report_len: ep.report_len,
+                ring: ep.ring,
+                buf_phys: ep.buf_phys,
                 prev_keys: [0; 6],
                 prev_mouse_btns: 0,
             });
@@ -754,6 +804,22 @@ impl XhciController {
                                 if wheel != 0 {
                                     input::push(InputEvent::MouseWheel { delta: wheel });
                                 }
+                            }
+                            HidKind::AbsMouse if data.len() >= 5 => {
+                                let btns = data[0] & 0x07;
+                                let x = u16::from_le_bytes([data[1], data[2]]).min(32767);
+                                let y = u16::from_le_bytes([data[3], data[4]]).min(32767);
+                                input::push(InputEvent::MouseAbs { x, y });
+                                let changed = btns ^ dev.prev_mouse_btns;
+                                for bit in 0..3u8 {
+                                    if (changed & (1 << bit)) != 0 {
+                                        input::push(InputEvent::MouseButton {
+                                            button: bit,
+                                            pressed: (btns & (1 << bit)) != 0,
+                                        });
+                                    }
+                                }
+                                dev.prev_mouse_btns = btns;
                             }
                             _ => {}
                         }
@@ -909,7 +975,7 @@ fn init_one(pci: PciXhci, pml4_phys: u64) -> Option<XhciController> {
     if max_scratchpads > 0 {
         if let Some(sp_arr) = mem::alloc_dma_zeroed((max_scratchpads * 8).max(4096), 4096) {
             for i in 0..max_scratchpads {
-                if let Some(page) = mem::alloc_zeroed_page_phys() {
+                if let Some(page) = mem::alloc_dma_zeroed(4096, 4096) {
                     unsafe {
                         ((sp_arr + (i as u64) * 8) as *mut u64).write_volatile(page);
                     }
@@ -985,11 +1051,11 @@ fn init_one(pci: PciXhci, pml4_phys: u64) -> Option<XhciController> {
     Some(ctrl)
 }
 
-pub fn init(pml4_phys: u64) {
+pub fn init(pml4_phys: u64) -> (usize, usize) {
     let controllers = find_all_xhci_pci();
     if controllers.is_empty() {
         kprintln!("[xhci] No xHCI controller found on PCI");
-        return;
+        return (0, 0);
     }
     let mut ready = Vec::new();
     for pci in controllers {
@@ -997,15 +1063,17 @@ pub fn init(pml4_phys: u64) {
             ready.push(ctrl);
         }
     }
+    let active = ready.len();
     let total_hid: usize = ready.iter().map(|c| c.hid_devices.len()).sum();
     kprintln!(
         "[xhci] {} active controller(s), {} total HID device(s)",
-        ready.len(),
+        active,
         total_hid
     );
     unsafe {
         XHCI_CONTROLLERS = ready;
     }
+    (active, total_hid)
 }
 
 pub fn poll() {

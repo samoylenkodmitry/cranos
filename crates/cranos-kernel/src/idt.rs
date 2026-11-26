@@ -118,9 +118,13 @@ extern "C" fn exception_dispatch(frame: &ExceptionFrame) -> ! {
         frame.r8,
         frame.r9
     );
-    loop {
-        unsafe { asm!("cli; hlt") };
-    }
+    // Paint red banner across top of GOP framebuffer (with vector code stripes)
+    // and auto-reboot after 10 seconds so headless/KVM hardware always recovers.
+    crate::fb::diag_strip(8, 0x00E1_1D48, 24);
+    crate::fb::diag_strip((frame.vector as u32 & 7).max(1), 0x00FA_CC15, 8);
+    kprintln!("Auto-rebooting in 10s...");
+    crate::cpu::busy_wait_us(10_000_000);
+    crate::cpu::reboot();
 }
 
 #[unsafe(naked)]

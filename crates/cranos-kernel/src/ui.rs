@@ -25,6 +25,7 @@ pub struct SystemSummary {
     pub huge_pages_1g: bool,
     pub barrier_ns: u64,
     pub gop_res: String,
+    pub input_summary: String,
     pub model_name: String,
     pub model_detail: String,
     pub has_model: bool,
@@ -327,8 +328,8 @@ pub fn CranosApp(handle: UiHandle) {
                                     );
                                     Text(
                                         format!(
-                                            "RAM: {} MiB usable  |  Display: {} (PAT Write-Combining)  |  Boot: {} ms",
-                                            sys_c.ram_mib, sys_c.gop_res, sys_c.boot_ms
+                                            "RAM: {} MiB usable  |  Display: {} (PAT WC)  |  Input: {}  |  Boot: {} ms",
+                                            sys_c.ram_mib, sys_c.gop_res, sys_c.input_summary, sys_c.boot_ms
                                         ),
                                         Modifier::empty(),
                                         txt(text_muted, 14.0),

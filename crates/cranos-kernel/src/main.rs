@@ -146,17 +146,21 @@ fn kernel_main(boot_info_ptr: u64) -> ! {
         }
     }
 
+    fb::register_diag_fb(&boot_info.fb);
+    fb::diag_strip(1, 0x0038_BDF8, 6);
+
     cpu::enable_simd_on_current_core();
     cpu::configure_pat_wc();
     let feats = cpu::detect_features();
     let tsc_hz = cpu::calibrate_tsc();
     let mem_stats = mem::init(boot_info);
+    fb::diag_strip(2, 0x0038_BDF8, 6);
 
     std::panic::set_hook(std::boxed::Box::new(|info| {
         kprintln!("\n=== CRANOS RUST PANIC ===\n{}", info);
-        loop {
-            unsafe { asm!("cli; hlt") };
-        }
+        fb::diag_strip(8, 0x00F9_7316, 24);
+        cpu::busy_wait_us(10_000_000);
+        cpu::reboot();
     }));
 
     cpu::set_identity_range_cache_attr(
@@ -186,6 +190,7 @@ fn kernel_main(boot_info_ptr: u64) -> ! {
     );
 
     smp::init(boot_info.acpi_rsdp_addr, boot_info.pml4_phys_addr);
+    fb::diag_strip(4, 0x0038_BDF8, 6);
 
     let worker_mask = AtomicU64::new(0);
     let t0 = cpu::now_nanos();
@@ -204,7 +209,8 @@ fn kernel_main(boot_info_ptr: u64) -> ! {
     );
 
     ps2::init();
-    xhci::init(boot_info.pml4_phys_addr);
+    let (xhci_ctrls, xhci_hids) = xhci::init(boot_info.pml4_phys_addr);
+    fb::diag_strip(6, 0x0038_BDF8, 6);
 
     let mut session: Option<LlmSession> = if boot_info.model_phys_addr != 0 && boot_info.model_size > 0 {
         kprintln!(
@@ -263,6 +269,7 @@ fn kernel_main(boot_info_ptr: u64) -> ! {
         huge_pages_1g: boot_info.has_1gib_pages != 0,
         barrier_ns,
         gop_res: format!("{}x{}", boot_info.fb.width, boot_info.fb.height),
+        input_summary: format!("{} xHCI ctrl / {} USB HID + PS/2", xhci_ctrls, xhci_hids),
         model_name,
         model_detail,
         has_model,
@@ -325,6 +332,13 @@ fn kernel_main(boot_info_ptr: u64) -> ! {
                 InputEvent::MouseMove { dx, dy } => {
                     cursor_x = (cursor_x + dx as f32).clamp(0.0, (boot_info.fb.width - 1) as f32);
                     cursor_y = (cursor_y + dy as f32).clamp(0.0, (boot_info.fb.height - 1) as f32);
+                    cursor_moved = true;
+                    ui.mouse_move(cursor_x / ui_scale, cursor_y / ui_scale);
+                    hw_fb.draw_cursor(cursor_x as u32, cursor_y as u32);
+                }
+                InputEvent::MouseAbs { x, y } => {
+                    cursor_x = ((x as f32) / 32767.0) * (boot_info.fb.width - 1) as f32;
+                    cursor_y = ((y as f32) / 32767.0) * (boot_info.fb.height - 1) as f32;
                     cursor_moved = true;
                     ui.mouse_move(cursor_x / ui_scale, cursor_y / ui_scale);
                     hw_fb.draw_cursor(cursor_x as u32, cursor_y as u32);

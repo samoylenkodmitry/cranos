@@ -2,6 +2,12 @@
 
 CranOS is a bare-metal x86_64 operating system in Rust and assembly. It boots directly from UEFI into a Cranpose UI and runs a multi-core AVX2/AVX-VNNI Qwen3 LLM engine without a Linux kernel or Linux userspace.
 
+
+
+<img width="4080" height="3072" alt="PXL_20261126_105220330 MP" src="https://github.com/user-attachments/assets/4428a3a0-dd12-422d-b397-8b6b81de3f61" />
+
+
+
 ## Architecture
 
 - **`crates/cranos-boot`** (`x86_64-unknown-uefi`): Pure-Rust UEFI Stage 1 loader. It picks a linear 32-bit GOP framebuffer (preferring `1920x1080`), locates ACPI RSDP, reads `model.gguf` from FAT32 (`SimpleFileSystem`) or ext4 partitions (`BlockIo` extent reader with `IoAlign` handling) into 2 MiB-aligned physical RAM, loads the embedded higher-half kernel ELF, builds 1 GiB/2 MiB 4-level page tables below 4 GiB, exits UEFI Boot Services, enables SSE and AVX, and jumps to the kernel.

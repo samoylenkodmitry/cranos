@@ -34,7 +34,7 @@ https://github.com/user-attachments/assets/ff6946e1-d90a-491f-a782-d7b3f6d4dc53
 
 ## Prerequisites and Build
 
-CranOS builds against the `feat/no-std-framebuffer` branch of `Cranpose` checked out as a sibling directory `../Cranpose-nostd` alongside this repository.
+CranOS builds against upstream `Cranpose` `main` using its `framebuffer`, `embedded-default-font`, and `host-timers` features.
 
 ```bash
 # Build dist/cranos.efi (embeds cranos-kernel inside cranos-boot)

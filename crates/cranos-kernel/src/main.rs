@@ -22,9 +22,8 @@ use core::arch::asm;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cranos_boot_info::{BOOT_INFO_MAGIC, BootInfo};
-use cranpose::framebuffer::{Framebuffer as CranposeFramebuffer, PixelRect};
-use cranpose_foundation::PointerButton;
-use cranpose_services::SystemTheme;
+use cranpose::framebuffer::{Framebuffer as CranposeFramebuffer, PixelRect, PointerButton};
+use cranpose::prelude::SystemTheme;
 
 use crate::input::{InputEvent, KeyCode};
 use crate::llm_session::{LlmSession, SessionPhase};

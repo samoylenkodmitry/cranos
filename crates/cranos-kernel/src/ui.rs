@@ -4,7 +4,6 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use cranpose::{prelude::*, text::TextUnit};
-use cranpose_core::MutableState;
 
 use crate::llm_session::{PerfMetrics, SessionPhase};
 
@@ -135,7 +134,7 @@ impl PartialEq for UiHandle {
 #[composable]
 pub fn CranosApp(handle: UiHandle) {
     let shared = handle.0;
-    let rev = cranpose_core::rememberMutableStateOf(|| 0u64);
+    let rev = rememberMutableStateOf(|| 0u64);
     {
         let mut s = shared.borrow_mut();
         if s.rev_state.is_none() {

@@ -59,17 +59,28 @@ if [[ -n "$MODEL_SRC" && -f "$MODEL_SRC" ]]; then
     echo "==> Model ready at $MODEL_DST ($(du -h "$MODEL_DST" | awk '{print $1}'))"
 fi
 
+find_boot_num() {
+    efibootmgr -v | TARGET="$1" awk -F'[*\t]' '
+        !found && index(tolower($0), tolower(ENVIRON["TARGET"])) > 0 {
+            if (match($1, /Boot([0-9A-Fa-f]+)/, m)) {
+                print toupper(m[1])
+                found = 1
+            }
+        }
+    '
+}
+
 # Save current BootOrder so the existing #1 default entry stays first.
 ORIG_ORDER="$(efibootmgr | awk '/^BootOrder:/ { print $2 }')"
 
-if efibootmgr -v | grep -Fqi "$EFI_REL"; then
+if [[ -n "$(find_boot_num "$EFI_REL")" ]]; then
     echo "==> UEFI boot entry for $EFI_REL already exists."
 else
     echo "==> Creating independent UEFI boot entry '$LABEL' on $disk partition $part..."
     efibootmgr -c -d "$disk" -p "$part" -L "$LABEL" -l "$EFI_REL" >/dev/null
-    CRANOS_NUM="$(efibootmgr -v | awk -F'[*\t]' 'index(tolower($0), "\\efi\\cranos\\cranos.efi") > 0 { match($1, /Boot([0-9A-F]+)/, m); print m[1] }' | head -1)"
+    CRANOS_NUM="$(find_boot_num "$EFI_REL")"
     if [[ -n "$ORIG_ORDER" && -n "$CRANOS_NUM" ]]; then
-        CLEAN_ORIG="$(echo "$ORIG_ORDER" | tr ',' '\n' | grep -v "^${CRANOS_NUM}$" | tr '\n' ',' | sed 's/,$//' || true)"
+        CLEAN_ORIG="$(echo "$ORIG_ORDER" | tr ',' '\n' | grep -vi "^${CRANOS_NUM}$" | tr '\n' ',' | sed 's/,$//' || true)"
         if [[ -n "$CLEAN_ORIG" ]]; then
             efibootmgr -o "${CLEAN_ORIG},${CRANOS_NUM}" >/dev/null
         fi
@@ -80,7 +91,7 @@ echo ""
 echo "==> Current UEFI Boot Entries (default #1 preserved):"
 efibootmgr
 echo ""
-CRANOS_NUM="$(efibootmgr -v | awk -F'[*\t]' 'index(tolower($0), "\\efi\\cranos\\cranos.efi") > 0 { match($1, /Boot([0-9A-F]+)/, m); print m[1] }' | head -1)"
+CRANOS_NUM="$(find_boot_num "$EFI_REL")"
 echo "To boot CranOS once on next reboot without changing default boot order:"
 echo "  sudo efibootmgr --bootnext ${CRANOS_NUM:-XXXX} && sudo reboot"
 echo "Or press F7 / F12 at BIOS POST to pick '$LABEL' from the UEFI Boot Menu."

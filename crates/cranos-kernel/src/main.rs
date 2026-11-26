@@ -329,7 +329,11 @@ fn kernel_main(boot_info_ptr: u64) -> ! {
                         _ => continue,
                     };
                     ui.mouse_move(cursor_x, cursor_y);
-                    ui.mouse_button(btn, pressed);
+                    if pressed {
+                        ui.mouse_button_pressed(btn);
+                    } else {
+                        ui.mouse_button_released(btn);
+                    }
                 }
                 InputEvent::MouseWheel { delta } => {
                     ui.mouse_scroll(0.0, (delta as f32) * 32.0);

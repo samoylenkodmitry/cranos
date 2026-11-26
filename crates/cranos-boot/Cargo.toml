@@ -1,0 +1,8 @@
+[package]
+name = "cranos-boot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cranos-boot-info = { path = "../cranos-boot-info" }

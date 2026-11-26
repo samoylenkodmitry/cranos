@@ -1,0 +1,15 @@
+[package]
+name = "cranos-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cranos-boot-info = { path = "../cranos-boot-info" }
+cranos-llm = { path = "../cranos-llm" }
+cranpose = { path = "../../../Cranpose-nostd/crates/cranpose", default-features = false, features = ["framebuffer", "embedded-default-font"] }
+cranpose-core = { path = "../../../Cranpose-nostd/crates/cranpose-core" }
+cranpose-foundation = { path = "../../../Cranpose-nostd/crates/cranpose-foundation" }
+cranpose-services = { path = "../../../Cranpose-nostd/crates/cranpose-services", default-features = false }
+cranpose-ui = { path = "../../../Cranpose-nostd/crates/cranpose-ui" }
+libm = "0.2"

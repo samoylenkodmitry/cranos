@@ -1,0 +1,8 @@
+/target
+/dist
+*.img
+*.efi
+*.ppm
+*.png
+*.fd
+*.sock
